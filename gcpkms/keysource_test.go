@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +14,18 @@ import (
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/getsops/sops/v3/internal/testenv"
 )
+
+// TestMain isolates the process from the host's Google Cloud credentials.
+// newKMSClient falls back to the ambient application default credentials, so
+// without this the credential-handling tests below pass or fail depending on
+// whether the machine running them has gcloud credentials configured (or a
+// GOOGLE_APPLICATION_CREDENTIALS pointing at an unusable file).
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunMain(m))
+}
 
 var (
 	testResourceID = "projects/test-sops/locations/global/keyRings/test-sops/cryptoKeys/sops"

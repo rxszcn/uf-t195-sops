@@ -25,7 +25,35 @@ var (
 	// testKMSARN is the ARN on the test AWS KMS server. It is loaded
 	// by TestMain.
 	testKMSARN string
+	// testDockerUnavailable is empty when the Docker-backed test server was
+	// started, and otherwise explains why it was not. Tests that need the
+	// server skip with this reason instead of failing, so that the package's
+	// pure-Go tests still run on machines without Docker.
+	testDockerUnavailable string
 )
+
+// dockerReachable reports why the Docker daemon cannot be used for the
+// Docker-backed test server, or nil when it can. It deliberately does not use
+// pool.Retry: that retries for the pool's full default timeout (about a
+// minute), which would make an absent Docker daemon slow down a test run that
+// is only going to skip the backend tests anyway.
+func dockerReachable(pool *dockertest.Pool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pool.Client.PingWithContext(ctx); err != nil {
+		return fmt.Errorf("cannot reach the Docker daemon: %w", err)
+	}
+	return nil
+}
+
+// skipWithoutDocker skips the calling test when the Docker-backed AWS KMS
+// server could not be started, stating why.
+func skipWithoutDocker(t *testing.T) {
+	t.Helper()
+	if testDockerUnavailable != "" {
+		t.Skipf("skipping: AWS KMS test backend unavailable: %s", testDockerUnavailable)
+	}
+}
 
 const (
 	// dummyARN is a dummy AWS ARN which passes validation.
@@ -43,11 +71,22 @@ const (
 // backoff retry approach, and then sets testKMSARN to the ID of the generated key.
 // It continues to run all the tests, which can make use of the various `test*`
 // variables.
+//
+// When Docker or the AWS KMS image is unavailable, the tests that need the
+// server are skipped (each reporting testDockerUnavailable as the reason) rather
+// than failing the package; the remaining tests still run.
 func TestMain(m *testing.M) {
 	// Uses a sensible default on Windows (TCP/HTTP) and Linux/MacOS (socket)
 	pool, err := dockertest.NewPool("")
 	if err != nil {
-		logger.Fatalf("could not connect to docker: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot connect to Docker: %v", err)
+		os.Exit(m.Run())
+		return
+	}
+	if err := dockerReachable(pool); err != nil {
+		testDockerUnavailable = err.Error()
+		os.Exit(m.Run())
+		return
 	}
 
 	// Pull the image, create a container based on it, and run it
@@ -58,7 +97,9 @@ func TestMain(m *testing.M) {
 		ExposedPorts: []string{"8080"},
 	})
 	if err != nil {
-		logger.Fatalf("could not start resource: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot start the AWS KMS container: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	purgeResource := func() {
@@ -73,7 +114,9 @@ func TestMain(m *testing.M) {
 	kmsClient, err := createTestKMSClient(masterKey)
 	if err != nil {
 		purgeResource()
-		logger.Fatalf("could not create session: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot create AWS KMS client: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	var key *kms.CreateKeyOutput
@@ -85,14 +128,18 @@ func TestMain(m *testing.M) {
 		return nil
 	}); err != nil {
 		purgeResource()
-		logger.Fatalf("could not create key: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot create a key on the AWS KMS test server: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	if key.KeyMetadata.Arn != nil {
 		testKMSARN = *key.KeyMetadata.Arn
 	} else {
 		purgeResource()
-		logger.Fatalf("could not set arn")
+		testDockerUnavailable = "the AWS KMS test server returned a key without an ARN"
+		os.Exit(m.Run())
+		return
 	}
 
 	// Run the tests, but only if we succeeded in setting up the AWS KMS server.
@@ -241,7 +288,10 @@ func TestCreds_ApplyToMasterKey(t *testing.T) {
 }
 
 func TestMasterKey_Encrypt(t *testing.T) {
+	// Only the "encrypt" subtest needs the server-backed key. The error
+	// subtests use ARNs the server rejects, so they run without it.
 	t.Run("encrypt", func(t *testing.T) {
+		skipWithoutDocker(t)
 		key := createTestMasterKey(testKMSARN)
 		dataKey := []byte("UFO sightings")
 		assert.NoError(t, key.Encrypt(dataKey))
@@ -281,6 +331,7 @@ func TestMasterKey_Encrypt(t *testing.T) {
 }
 
 func TestMasterKey_EncryptIfNeeded(t *testing.T) {
+	skipWithoutDocker(t)
 	key := createTestMasterKey(testKMSARN)
 	assert.NoError(t, key.EncryptIfNeeded([]byte("data")))
 
@@ -305,6 +356,7 @@ func TestMasterKey_SetEncryptedDataKey(t *testing.T) {
 
 func TestMasterKey_Decrypt(t *testing.T) {
 	t.Run("decrypt", func(t *testing.T) {
+		skipWithoutDocker(t)
 		key := createTestMasterKey(testKMSARN)
 		kmsClient, err := createTestKMSClient(key)
 		assert.NoError(t, err)
@@ -322,6 +374,8 @@ func TestMasterKey_Decrypt(t *testing.T) {
 	})
 
 	t.Run("data key error", func(t *testing.T) {
+		// Fails at base64 decoding, before any client is created, so it does
+		// not need the test server.
 		key := createTestMasterKey(testKMSARN)
 		key.EncryptedKey = "invalid"
 		got, err := key.Decrypt()
@@ -350,6 +404,7 @@ func TestMasterKey_Decrypt(t *testing.T) {
 }
 
 func TestMasterKey_EncryptDecrypt_RoundTrip(t *testing.T) {
+	skipWithoutDocker(t)
 	dataKey := []byte("the wheels on the bus go round and round")
 
 	encryptKey := createTestMasterKey(testKMSARN)

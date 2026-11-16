@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -205,8 +206,15 @@ func (d GnuPGHome) Validate() error {
 	if !fi.IsDir() {
 		return fmt.Errorf("GNUGPHOME is not a directory")
 	}
-	if perm := fi.Mode().Perm(); perm != 0o700 {
-		return fmt.Errorf("GNUPGHOME has invalid permissions: got %#o wanted %#o", perm, 0o700)
+	// On Windows Go synthesizes POSIX permission bits for directories and
+	// always reports 0777; the directory is in fact protected by ACLs, which
+	// cannot be inspected through os.FileMode. Checking the mode there would
+	// reject every GnuPG home, including the ones NewGnuPGHome creates, so
+	// the check is restricted to platforms where the bits carry meaning.
+	if runtime.GOOS != "windows" {
+		if perm := fi.Mode().Perm(); perm != 0o700 {
+			return fmt.Errorf("GNUPGHOME has invalid permissions: got %#o wanted %#o", perm, 0o700)
+		}
 	}
 	return nil
 }
@@ -623,11 +631,23 @@ func fingerprintIndex(ring openpgp.EntityList) map[string]openpgp.Entity {
 // homeDir when provided. Stdout and stderr can be read from the returned
 // buffers. When the command fails, an error is returned.
 func gpgExec(ctx context.Context, homeDir string, args []string, stdin io.Reader) (stdout bytes.Buffer, stderr bytes.Buffer, err error) {
+	cmd := exec.CommandContext(ctx, gpgBinary(), args...)
 	if homeDir != "" {
-		args = append([]string{"--homedir", homeDir}, args...)
+		// GnuPG does not accept a Windows-style absolute path as the value of
+		// --homedir: it treats the path as relative to the current directory,
+		// so `--homedir C:\Users\...` resolves to
+		// `<cwd>\C:\Users\...` and fails with "directory does not exist".
+		// Running gpg with the home directory as its working directory and
+		// passing a relative "." works both for the Windows builds of GnuPG,
+		// which use either POSIX or native path conventions, and for GnuPG on
+		// other platforms.
+		if runtime.GOOS == "windows" && filepath.IsAbs(homeDir) {
+			cmd.Dir = homeDir
+			homeDir = "."
+		}
+		cmd.Args = append([]string{cmd.Args[0], "--homedir", homeDir}, cmd.Args[1:]...)
 	}
 
-	cmd := exec.CommandContext(ctx, gpgBinary(), args...)
 	cmd.Stdin = stdin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

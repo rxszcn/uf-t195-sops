@@ -8,6 +8,10 @@ BIN_DIR             := $(PROJECT_DIR)/bin
 
 GO                  := GOPROXY=https://proxy.golang.org go
 GO_TEST_FLAGS       ?= -race -coverprofile=profile.out -covermode=atomic
+# Packages whose tests guard the encryption chain. They are run as a dedicated
+# CI gate (see .github/workflows/cli.yml) in addition to the full suite, and are
+# the ones held to the "no host key material" rule.
+CRYPTO_PACKAGES     := . ./age ./pgp ./aes ./config ./kms ./hcvault ./gcpkms ./hckms ./keyservice ./decrypt ./shamir ./stores/...
 
 GITHUB_REPOSITORY   ?= github.com/getsops/sops
 
@@ -74,6 +78,40 @@ checkmd: $(MD_FILES)
 test: vendor
 	gpg --import pgp/sops_functional_tests_key.asc 2>&1 1>/dev/null || exit 0
 	unset SOPS_AGE_KEY; unset SOPS_AGE_KEY_FILE; unset SOPS_AGE_KEY_CMD; unset SOPS_AGE_RECIPIENT; unset SOPS_AGE_SSH_PRIVATE_KEY_FILE; unset SOPS_AGE_SSH_PRIVATE_KEY_CMD; LANG=en_US.UTF-8 $(GO) test $(GO_TEST_FLAGS) ./...
+
+# crypto-test runs the packages that guard the encryption chain with an
+# environment that cannot see the host's key material or credentials. The
+# TestMain of those packages already builds that sandbox (internal/testenv); the
+# explicit unset here additionally protects the packages that do not have one,
+# and makes the intent of the gate readable in CI logs.
+.PHONY: crypto-test
+crypto-test:
+	unset SOPS_AGE_KEY SOPS_AGE_KEY_FILE SOPS_AGE_KEY_CMD SOPS_AGE_RECIPIENT \
+		SOPS_AGE_SSH_PRIVATE_KEY_FILE SOPS_AGE_SSH_PRIVATE_KEY_CMD \
+		SOPS_GPG_EXEC GOOGLE_CREDENTIALS GOOGLE_OAUTH_ACCESS_TOKEN \
+		GOOGLE_APPLICATION_CREDENTIALS VAULT_TOKEN VAULT_ADDR \
+		AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE; \
+	GPG_AGENT_INFO= LANG=en_US.UTF-8 $(GO) test $(GO_TEST_FLAGS) $(CRYPTO_PACKAGES)
+
+# crypto-test-poisoned deliberately puts hostile key material and credentials in
+# the environment before running the same gate. Every test must either ignore it
+# or undo it itself; any red here means a test still trusts the host.
+.PHONY: crypto-test-poisoned
+crypto-test-poisoned:
+	SOPS_AGE_KEY="AGE-SECRET-KEY-1432K5YRNSC44GC4986NXMX6GVZ52WTMT9C79CLUVWYY4DKDHD5JSNDP4MC" \
+	SOPS_AGE_KEY_FILE=/nonexistent/sops-age-keys.txt \
+	SOPS_AGE_KEY_CMD="echo AGE-SECRET-KEY-1432K5YRNSC44GC4986NXMX6GVZ52WTMT9C79CLUVWYY4DKDHD5JSNDP4MC" \
+	SOPS_AGE_SSH_PRIVATE_KEY_FILE=/nonexistent/id_ed25519 \
+	SOPS_AGE_SSH_PRIVATE_KEY_CMD="echo bogus" \
+	GOOGLE_CREDENTIALS=bogus-credentials \
+	GOOGLE_OAUTH_ACCESS_TOKEN=bogus-token \
+	VAULT_TOKEN=bogus-token \
+	VAULT_ADDR=http://127.0.0.1:1 \
+	AWS_ACCESS_KEY_ID=bogus \
+	AWS_SECRET_ACCESS_KEY=bogus \
+	AWS_SESSION_TOKEN=bogus \
+	GPG_AGENT_INFO= \
+	LANG=en_US.UTF-8 $(GO) test $(GO_TEST_FLAGS) $(CRYPTO_PACKAGES)
 
 .PHONY: showcoverage
 showcoverage: test

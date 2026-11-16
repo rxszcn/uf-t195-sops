@@ -1,6 +1,7 @@
 package hcvault
 
 import (
+	"context"
 	"fmt"
 	logger "log"
 	"os"
@@ -27,30 +28,64 @@ var (
 	// testVaultAddress is the HTTP/S address of the Vault server, it is set
 	// by TestMain after booting it.
 	testVaultAddress string
-	// Whether to skip all Docker-based tests.
-	testSkipDocker = false
+	// testDockerUnavailable is empty when the Docker-backed test server was
+	// started, and otherwise explains why it was not. Tests that need the
+	// server skip with this reason instead of failing, so that the package's
+	// pure-Go tests still run on machines without Docker.
+	testDockerUnavailable string
 )
+
+// dockerReachable reports why the Docker daemon cannot be used for the
+// Docker-backed test server, or nil when it can. It deliberately does not use
+// pool.Retry: that retries for the pool's full default timeout (about a
+// minute), which would make an absent Docker daemon slow down a test run that
+// is only going to skip the backend tests anyway.
+func dockerReachable(pool *dockertest.Pool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pool.Client.PingWithContext(ctx); err != nil {
+		return fmt.Errorf("cannot reach the Docker daemon: %w", err)
+	}
+	return nil
+}
+
+// skipWithoutDocker skips the calling test when the Docker-backed Vault server
+// could not be started, stating why.
+func skipWithoutDocker(t *testing.T) {
+	t.Helper()
+	if testDockerUnavailable != "" {
+		t.Skipf("skipping: Vault test backend unavailable: %s", testDockerUnavailable)
+	}
+}
 
 // TestMain initializes a Vault server using Docker, writes the HTTP address to
 // testVaultAddress, waits for it to become ready to serve requests, and enables
 // Vault Transit on the testEnginePath. It then runs all the tests, which can
 // make use of the various `test*` variables.
+//
+// When Docker or the Vault image is unavailable, the tests that need the server
+// are skipped (each reporting testDockerUnavailable as the reason) rather than
+// failing the package; the remaining tests still run.
 func TestMain(m *testing.M) {
-	if testSkipDocker {
-		os.Exit(m.Run())
-		return
-	}
-
 	// Uses a sensible default on Windows (TCP/HTTP) and Linux/MacOS (socket)
 	pool, err := dockertest.NewPool("")
 	if err != nil {
-		logger.Fatalf("could not connect to docker: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot connect to Docker: %v", err)
+		os.Exit(m.Run())
+		return
+	}
+	if err := dockerReachable(pool); err != nil {
+		testDockerUnavailable = err.Error()
+		os.Exit(m.Run())
+		return
 	}
 
 	// Pull the image, create a container based on it, and run it
 	resource, err := pool.Run("ghcr.io/getsops/ci-container-images/vault", testVaultVersion, []string{"VAULT_DEV_ROOT_TOKEN_ID=" + testVaultToken})
 	if err != nil {
-		logger.Fatalf("could not start resource: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot start the Vault container: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	purgeResource := func() {
@@ -78,12 +113,16 @@ func TestMain(m *testing.M) {
 		return nil
 	}); err != nil {
 		purgeResource()
-		logger.Fatalf("could not connect to docker: %s", err)
+		testDockerUnavailable = fmt.Sprintf("Vault server did not become ready: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	if err = enableVaultTransit(testVaultAddress, testVaultToken, testEnginePath); err != nil {
 		purgeResource()
-		logger.Fatalf("could not enable Vault transit: %s", err)
+		testDockerUnavailable = fmt.Sprintf("cannot enable Vault transit: %v", err)
+		os.Exit(m.Run())
+		return
 	}
 
 	// Run the tests, but only if we succeeded in setting up the Vault server
@@ -186,9 +225,7 @@ func TestNewMasterKeyFromURI(t *testing.T) {
 }
 
 func TestMasterKey_Encrypt(t *testing.T) {
-	if testSkipDocker {
-		return
-	}
+	skipWithoutDocker(t)
 
 	key := NewMasterKey(testVaultAddress, testEnginePath, "encrypt")
 	(Token(testVaultToken)).ApplyToMasterKey(key)
@@ -218,9 +255,7 @@ func TestMasterKey_Encrypt(t *testing.T) {
 }
 
 func TestMasterKey_EncryptIfNeeded(t *testing.T) {
-	if testSkipDocker {
-		return
-	}
+	skipWithoutDocker(t)
 
 	key := NewMasterKey(testVaultAddress, testEnginePath, "encrypt-if-needed")
 	(Token(testVaultToken)).ApplyToMasterKey(key)
@@ -241,9 +276,7 @@ func TestMasterKey_EncryptedDataKey(t *testing.T) {
 }
 
 func TestMasterKey_Decrypt(t *testing.T) {
-	if testSkipDocker {
-		return
-	}
+	skipWithoutDocker(t)
 
 	key := NewMasterKey(testVaultAddress, testEnginePath, "decrypt")
 	(Token(testVaultToken)).ApplyToMasterKey(key)
@@ -273,9 +306,7 @@ func TestMasterKey_Decrypt(t *testing.T) {
 }
 
 func TestMasterKey_EncryptDecrypt_RoundTrip(t *testing.T) {
-	if testSkipDocker {
-		return
-	}
+	skipWithoutDocker(t)
 
 	token := Token(testVaultToken)
 

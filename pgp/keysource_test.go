@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -15,7 +16,16 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/getsops/sops/v3/internal/testenv"
 )
+
+// TestMain isolates the process from the GnuPG keyring and agent of the
+// machine running the tests. Tests that need a keyring create their own
+// GnuPGHome and import the fixtures into it.
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunMain(m))
+}
 
 var (
 	mockPublicKey   = "testdata/public.gpg"
@@ -85,7 +95,12 @@ func TestGnuPGHome_Import_With_Missing_Binary(t *testing.T) {
 	b, err := os.ReadFile(mockPublicKey)
 	assert.NoError(t, err)
 	err = gnuPGHome.Import(b)
-	assert.ErrorContains(t, err, "failed to import armored key data into GnuPG keyring: fork/exec /does/not/exist: no such file or directory")
+	// The wording of the error differs between platforms: on Unix Go prefixes
+	// it with "fork/exec /does/not/exist: no such file or directory", on
+	// Windows it is "exec: "/does/not/exist": executable file not found in
+	// %PATH%". Assert on the stable part instead.
+	assert.ErrorContains(t, err, "failed to import armored key data into GnuPG keyring")
+	assert.ErrorContains(t, err, "/does/not/exist")
 }
 
 func TestGnuPGHome_ImportFile(t *testing.T) {
@@ -130,6 +145,12 @@ func TestGnuPGHome_Validate(t *testing.T) {
 	})
 
 	t.Run("wrong permissions", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			// Windows has no POSIX permission bits: os.FileMode reports 0777
+			// for every directory and Validate skips the check there, so this
+			// case cannot be exercised on that platform.
+			t.Skip("skipping: Windows does not expose POSIX directory permissions")
+		}
 		tmpDir := t.TempDir()
 
 		err := os.Chmod(tmpDir, 0o755)
@@ -721,7 +742,16 @@ func Test_shortenFingerprint(t *testing.T) {
 // TODO(hidde): previous tests kept around for now.
 
 func TestPGP(t *testing.T) {
-	key := NewMasterKeyFromFingerprint("FBC7B9E2A4F9289AC0C1D4843D16CEE4A27381B4")
+	// Drive the round trip from the keyring fixtures instead of the invoking
+	// user's GnuPG keyring. The previous version relied on
+	// pgp/sops_functional_tests_key.asc having been imported into the host
+	// keyring, which `make test` did implicitly and which made the test fail
+	// on a machine without that key (and on any machine that has a different
+	// key installed).
+	key := NewMasterKeyFromFingerprint(mockFingerprint)
+	PubRing(mockPubRing).ApplyToMasterKey(key)
+	SecRing(mockSecRing).ApplyToMasterKey(key)
+
 	f := func(x []byte) bool {
 		if len(x) == 0 {
 			return true

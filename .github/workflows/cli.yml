@@ -80,6 +80,61 @@ jobs:
         with:
           name: sops-${{ matrix.go-version }}-${{ matrix.os }}-${{ github.sha }}
           path: sops-${{ matrix.go-version }}-${{ matrix.os }}-${{ github.sha }}
+
+  # The encryption chain (age/PGP/KMS/Vault key loading plus the AES-GCM and MAC
+  # semantics on top of it) is what protects a release. It used to be covered by
+  # the unit tests only, which ran in the same job as the build and could pass or
+  # fail depending on the key material of the machine running them: a developer
+  # with ~/.ssh keys saw green where a clean runner saw red, and the reverse was
+  # possible for cloud credentials. Run the same gate twice, once with an
+  # environment scrubbed of key material and once with deliberately hostile key
+  # material and credentials in it. Both must pass, which is only possible when
+  # every test supplies the keys it needs instead of inheriting them.
+  crypto:
+    name: Encryption chain gate (${{ matrix.environment }} key environment)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "clean": nothing points at host key material or credentials.
+        # "poisoned": SOPS_AGE_*, cloud and Vault variables all point at
+        # material that must not influence the tests.
+        environment: [clean, poisoned]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Vendor Go Modules
+        run: make vendor
+
+      # `make vendor` runs `go mod tidy`, which can rewrite go.mod/go.sum. Fail
+      # here rather than leaving a stale module file behind.
+      - name: Ensure clean working tree
+        run: git diff --exit-code
+
+      - name: Run the encryption chain gate without host key material
+        if: matrix.environment == 'clean'
+        run: make crypto-test
+
+      - name: Run the encryption chain gate with hostile key material
+        if: matrix.environment == 'poisoned'
+        run: make crypto-test-poisoned
+
   test:
     name: Functional tests
     runs-on: ubuntu-latest
@@ -139,6 +194,7 @@ jobs:
 
     needs:
       - build
+      - crypto
       - test
 
     runs-on: ubuntu-latest

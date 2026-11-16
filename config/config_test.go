@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/getsops/sops/v3/keys"
@@ -706,9 +707,18 @@ func TestLoadConfigFileWithInvalidParameters(t *testing.T) {
 
 func TestLoadConfigFileWithAmbiguousPath(t *testing.T) {
 	config := parseConfigFile(sampleConfigWithAmbiguousPath, t)
-	_, err := parseCreationRuleForFile(config, "/foo/config", "/foo/foo/bar", nil)
+
+	// parseCreationRuleForFile makes the config directory absolute and strips
+	// it from the file path before matching, so the fixture must use real
+	// absolute paths with the host's separator. Hard-coded POSIX paths such as
+	// "/foo/config" are not absolute on Windows and made this test platform
+	// dependent.
+	root := t.TempDir()
+	confPath := filepath.Join(root, "config")
+
+	_, err := parseCreationRuleForFile(config, confPath, filepath.Join(root, "foo", "bar"), nil)
 	assert.Nil(t, err)
-	_, err = parseCreationRuleForFile(config, "/foo/config", "/foo/fuu/bar", nil)
+	_, err = parseCreationRuleForFile(config, confPath, filepath.Join(root, "fuu", "bar"), nil)
 	assert.NotNil(t, err)
 }
 

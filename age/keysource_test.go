@@ -9,7 +9,17 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/getsops/sops/v3/internal/testenv"
 )
+
+// TestMain isolates the process from the key material of the machine running
+// the tests. Without it, the SSH key discovery in loadAgeSSHIdentities finds
+// the invoking user's ~/.ssh/id_ed25519 or id_rsa, and the passphrase tests
+// talk to their gpg-agent, so the outcome of these tests depends on the host.
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunMain(m))
+}
 
 const (
 	// mockRecipient is a mock age recipient, it matches mockIdentity.
@@ -582,7 +592,11 @@ func TestMasterKey_loadIdentities(t *testing.T) {
 func overwriteUserConfigDir(t *testing.T, path string) {
 	switch runtime.GOOS {
 	case "windows":
+		// os.UserConfigDir reads %AppData%; os.UserHomeDir reads %USERPROFILE%
+		// and ignores HOME. Both must be overwritten, otherwise the tests
+		// create files in the real user's home directory.
 		t.Setenv("AppData", path)
+		t.Setenv("USERPROFILE", path)
 	case "plan9": // This adds "/lib" as a suffix to $home
 		t.Setenv("home", path)
 	default: // Unix
